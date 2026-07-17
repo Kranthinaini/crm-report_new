@@ -317,7 +317,6 @@ HOURS_PER_DAY_PER_HALF = 2
 # Distance threshold above which we flag instead of showing the number
 DISTANCE_FLAG_KM = 200
 DISTANCE_FLAG_LABEL = ">200 km"
-INVALID_LOCATION_LABEL = "Invalid Location"
 
 # Rough bounding box for India, used to sanity-check that a lat/long pair
 # is plausibly within the country. Coordinates outside this box (or
@@ -897,7 +896,7 @@ if uploaded_file:
         else:
             fh_distance_km, fh_invalid = 0.0, False
 
-        fh_distance_display = INVALID_LOCATION_LABEL if fh_invalid else format_distance(fh_distance_km)
+        fh_distance_display = "" if fh_invalid else format_distance(fh_distance_km)
 
         # ---------------- SH ----------------
 
@@ -927,7 +926,7 @@ if uploaded_file:
         else:
             sh_distance_km, sh_invalid = 0.0, False
 
-        sh_distance_display = INVALID_LOCATION_LABEL if sh_invalid else format_distance(sh_distance_km)
+        sh_distance_display = "" if sh_invalid else format_distance(sh_distance_km)
 
         # ---------------- Total ----------------
 
@@ -1014,8 +1013,8 @@ if uploaded_file:
             sh_logins,
             sh_distance_display,
             total,
-            employee_working_days,
             total_logins,
+            employee_working_days,
             working_days_count,
             compliance,
             remarks
@@ -1069,8 +1068,8 @@ if uploaded_file:
             sh_logins,
             0.0,      # SH Distance (km)
             0,        # Total Visits (Day)
-            0,        # Employee Working Days (no CRM activity)
             total_logins,
+            0,        # Employee Working Days (no CRM activity)
             working_days_count,
             compliance,
             "No CRM visit data for this employee — added from Credit Report."
@@ -1097,6 +1096,7 @@ if uploaded_file:
         "SH Logins",
         "SH Distance (km)",
         "Total Visits (Day)",
+        "Total Logins",
         "Employee Working Days",
         "Working Days Count",
         "Overall Compliance",
@@ -1190,7 +1190,7 @@ if uploaded_file:
             return "background-color:#FCF1DF; color:#9C6A17; font-weight:600;"
         if val in ("Not Met", "Non-Compliant"):
             return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
-        if val in (DISTANCE_FLAG_LABEL, INVALID_LOCATION_LABEL):
+        if val == DISTANCE_FLAG_LABEL:
             return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
         return ""
 
@@ -1302,11 +1302,11 @@ if uploaded_file:
             c.fill = red_fill
 
         c = ws.cell(row=row, column=fh_distance_col)
-        if c.value in (DISTANCE_FLAG_LABEL, INVALID_LOCATION_LABEL):
+        if c.value == DISTANCE_FLAG_LABEL:
             c.fill = red_fill
 
         c = ws.cell(row=row, column=sh_distance_col)
-        if c.value in (DISTANCE_FLAG_LABEL, INVALID_LOCATION_LABEL):
+        if c.value == DISTANCE_FLAG_LABEL:
             c.fill = red_fill
 
     # ==========================
