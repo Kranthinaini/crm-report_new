@@ -316,7 +316,14 @@ HOURS_PER_DAY_PER_HALF = 2
 
 # Distance threshold above which we flag instead of showing the number
 DISTANCE_FLAG_KM = 200
-DISTANCE_FLAG_LABEL = ">200KM"
+DISTANCE_FLAG_LABEL = ">200 km"
+INVALID_LOCATION_LABEL = "Invalid Location"
+
+# Rough bounding box for India, used to sanity-check that a lat/long pair
+# is plausibly within the country. Coordinates outside this box (or
+# missing/unparseable coordinates) are treated as an invalid location.
+INDIA_LAT_MIN, INDIA_LAT_MAX = 6.5, 37.6
+INDIA_LON_MIN, INDIA_LON_MAX = 68.0, 97.5
 
 if date_from == date_to:
     st.caption(f"Showing visits for: {date_from.strftime('%d-%b-%Y')}")
@@ -541,38 +548,65 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 # ============================================================
-# Helper: total distance covered, summed per calendar day
+# Helper: is a lat/long pair a plausible, in-country location?
 # ============================================================
 
-def daily_summed_distance(session_df, lat_col, lon_col):
+def is_valid_india_coord(lat, lon):
     """
-    Given a subset of rows for one CM/one session (FH or SH), sorts each
-    calendar day's pings chronologically and sums the haversine distance
-    between consecutive pings, then sums those daily totals together —
-    mirroring daily_summed_minutes() so a multi-day range doesn't overstate
-    distance the way a naive first-to-last-point calc across the whole
-    range would.
+    Returns False if lat/lon is missing/unparseable, or falls outside a
+    rough bounding box for India. Used to flag pings that are clearly bad
+    data (0,0 / null island, GPS glitches) or genuinely outside the
+    country, so the distance calc doesn't silently produce a misleading
+    number for them.
     """
-    if session_df.empty or lat_col is None or lon_col is None:
-        return 0.0
+    if pd.isna(lat) or pd.isna(lon):
+        return False
+    if not (INDIA_LAT_MIN <= lat <= INDIA_LAT_MAX):
+        return False
+    if not (INDIA_LON_MIN <= lon <= INDIA_LON_MAX):
+        return False
+    return True
 
-    total_km = 0.0
 
-    for _, day_df in session_df.groupby(session_df["LoginDate"].dt.date):
-        day_sorted = day_df.sort_values("LoginDate")
-        lats = day_sorted[lat_col].tolist()
-        lons = day_sorted[lon_col].tolist()
+# ============================================================
+# Helper: distance between the first visit and the last visit of a session
+# ============================================================
 
-        for i in range(1, len(lats)):
-            total_km += haversine_km(lats[i - 1], lons[i - 1], lats[i], lons[i])
+def first_last_distance(session_df, lat_col, lon_col):
+    """
+    Given a subset of rows for one CM/one session (FH or SH), computes the
+    straight-line (haversine) distance between the row with the earliest
+    LoginDate (the session's "first visit") and the row with the latest
+    LoginDate (the "last visit") — mirroring the First Visit / Last Visit
+    columns already shown in the summary, rather than summing distance
+    across every intermediate ping.
 
-    return total_km
+    Returns (distance_km, is_invalid):
+    - distance_km is 0.0 whenever there's nothing to compare (0-1 visits)
+      or either endpoint's coordinates are invalid.
+    - is_invalid is True when there are 2+ visits but either the first or
+      last visit's coordinates are missing or fall outside India's
+      bounding box — meaning the distance figure can't be trusted.
+    """
+    if session_df.empty or lat_col is None or lon_col is None or len(session_df) < 2:
+        return 0.0, False
+
+    first_row = session_df.loc[session_df["LoginDate"].idxmin()]
+    last_row = session_df.loc[session_df["LoginDate"].idxmax()]
+
+    lat1, lon1 = first_row[lat_col], first_row[lon_col]
+    lat2, lon2 = last_row[lat_col], last_row[lon_col]
+
+    if not is_valid_india_coord(lat1, lon1) or not is_valid_india_coord(lat2, lon2):
+        return 0.0, True
+
+    return haversine_km(lat1, lon1, lat2, lon2), False
 
 
 def format_distance(km_value):
     """
     Returns the display value for a distance-covered figure: the flagged
-    label (">200KM") when it exceeds the threshold, otherwise the value
+    label (">200 km") when it exceeds the threshold, otherwise the value
     rounded to 2 decimal places. Keeping the flagged case as a distinct
     string (rather than the number) lets both the on-screen preview and
     the exported Excel highlight it in red.
@@ -853,8 +887,17 @@ if uploaded_file:
             fh_duration = "00:00"
             fh_status = "Not Met"
 
-        fh_distance_km = daily_summed_distance(fh, lat_col, lon_col) if has_geo else 0.0
-        fh_distance_display = format_distance(fh_distance_km)
+        # Distance is the straight-line distance between the FH first
+        # visit and the FH last visit (not a sum across every ping) —
+        # see first_last_distance(). If either endpoint's coordinates
+        # are missing or fall outside India, the location is flagged
+        # invalid instead of producing a distance number.
+        if has_geo:
+            fh_distance_km, fh_invalid = first_last_distance(fh, lat_col, lon_col)
+        else:
+            fh_distance_km, fh_invalid = 0.0, False
+
+        fh_distance_display = INVALID_LOCATION_LABEL if fh_invalid else format_distance(fh_distance_km)
 
         # ---------------- SH ----------------
 
@@ -879,8 +922,12 @@ if uploaded_file:
             sh_duration = "00:00"
             sh_status = "Not Met"
 
-        sh_distance_km = daily_summed_distance(sh, lat_col, lon_col) if has_geo else 0.0
-        sh_distance_display = format_distance(sh_distance_km)
+        if has_geo:
+            sh_distance_km, sh_invalid = first_last_distance(sh, lat_col, lon_col)
+        else:
+            sh_distance_km, sh_invalid = 0.0, False
+
+        sh_distance_display = INVALID_LOCATION_LABEL if sh_invalid else format_distance(sh_distance_km)
 
         # ---------------- Total ----------------
 
@@ -937,6 +984,12 @@ if uploaded_file:
                 remarks_list.append(
                     "SH visits bunched (avg gap <5m); verify field presence."
                 )
+
+        if fh_invalid:
+            remarks_list.append("FH: Invalid Location.")
+
+        if sh_invalid:
+            remarks_list.append("SH: Invalid Location.")
 
         remarks = " ".join(remarks_list)
 
@@ -1044,7 +1097,6 @@ if uploaded_file:
         "SH Logins",
         "SH Distance (km)",
         "Total Visits (Day)",
-        "Total Logins",
         "Employee Working Days",
         "Working Days Count",
         "Overall Compliance",
@@ -1138,7 +1190,7 @@ if uploaded_file:
             return "background-color:#FCF1DF; color:#9C6A17; font-weight:600;"
         if val in ("Not Met", "Non-Compliant"):
             return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
-        if val == DISTANCE_FLAG_LABEL:
+        if val in (DISTANCE_FLAG_LABEL, INVALID_LOCATION_LABEL):
             return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
         return ""
 
@@ -1250,11 +1302,11 @@ if uploaded_file:
             c.fill = red_fill
 
         c = ws.cell(row=row, column=fh_distance_col)
-        if c.value == DISTANCE_FLAG_LABEL:
+        if c.value in (DISTANCE_FLAG_LABEL, INVALID_LOCATION_LABEL):
             c.fill = red_fill
 
         c = ws.cell(row=row, column=sh_distance_col)
-        if c.value == DISTANCE_FLAG_LABEL:
+        if c.value in (DISTANCE_FLAG_LABEL, INVALID_LOCATION_LABEL):
             c.fill = red_fill
 
     # ==========================
