@@ -256,7 +256,7 @@ with upload_col1:
     uploaded_file = st.file_uploader(
         "Upload CRM file (.xlsx or .csv)",
         type=["xlsx", "csv"],
-        help="Expects columns: Territory, Cluster, EmployeeName, City, LoginDate",
+        help="Expects columns: Territory, Cluster, EmployeeName, City, Lead Date, Lead Time",
         key="crm_uploader"
     )
 
@@ -521,6 +521,55 @@ def daily_summed_minutes(session_df):
 
 
 # ============================================================
+# Helper: count of working days on which a CM is compliant
+# ============================================================
+
+def daily_compliance_details(fh_df, sh_df, working_dates):
+    """
+    Calculates compliance day counts once per CM.
+
+    A day is compliant only when both FH and SH meet the 2-hour target.
+    The same result is used by Summary and Location Summary so their
+    compliant/non-compliant counts always match.
+    """
+    threshold = HOURS_PER_DAY_PER_HALF * 60
+
+    fh_daily = (
+        fh_df.groupby(fh_df["LoginDate"].dt.date)["LoginDate"]
+        .agg(lambda s: (s.max() - s.min()).total_seconds() / 60)
+        if not fh_df.empty else pd.Series(dtype=float)
+    )
+
+    sh_daily = (
+        sh_df.groupby(sh_df["LoginDate"].dt.date)["LoginDate"]
+        .agg(lambda s: (s.max() - s.min()).total_seconds() / 60)
+        if not sh_df.empty else pd.Series(dtype=float)
+    )
+
+    compliant_days = 0
+    non_compliant_days = 0
+
+    for d in working_dates:
+        fh_minutes = fh_daily.get(d, 0)
+        sh_minutes = sh_daily.get(d, 0)
+
+        if fh_minutes >= threshold and sh_minutes >= threshold:
+            # Fully Compliant
+            compliant_days += 1
+
+        elif fh_minutes < threshold and sh_minutes < threshold:
+            # Non-Compliant
+            non_compliant_days += 1
+
+        else:
+            # Partially Compliant
+            # Do not count as Non-Compliant
+            pass
+
+    return compliant_days, non_compliant_days
+
+
+# ============================================================
 # Helper: great-circle distance between two lat/long points, in km
 # ============================================================
 
@@ -737,7 +786,7 @@ if uploaded_file:
     # sometimes survive in CSV headers)
     df.columns = [str(c).strip() for c in df.columns]
 
-    required_cols = {"Territory", "Cluster", "EmployeeName", "City", "LoginDate"}
+    required_cols = {"Territory", "Cluster", "EmployeeName", "City", "Lead Date", "Lead Time"}
     missing_cols = required_cols - set(df.columns)
     if missing_cols:
         st.error(
@@ -745,6 +794,16 @@ if uploaded_file:
             f"Found columns: {', '.join(df.columns)}"
         )
         st.stop()
+
+    # "Lead Date" carries the actual visit date; "Lead Time" is a separate
+    # submission timestamp whose date part is just whenever the row was
+    # exported/synced (often the same day for the whole file) — only its
+    # time-of-day is meaningful. The rest of the app refers to the combined,
+    # correct visit timestamp internally as "LoginDate": Lead Date's date +
+    # Lead Time's time-of-day.
+    _lead_date = normalize_to_ist(df["Lead Date"])
+    _lead_time = normalize_to_ist(df["Lead Time"])
+    df["LoginDate"] = _lead_date.dt.normalize() + (_lead_time - _lead_time.dt.normalize())
 
     # ------------------------------------------------------------
     # Locate latitude/longitude columns for distance-covered calc.
@@ -776,10 +835,16 @@ if uploaded_file:
             "Distance Covered will show as 0."
         )
 
-    # Convert LoginDate (handles mixed formats, normalizes to IST)
-    df["LoginDate"] = normalize_to_ist(df["LoginDate"])
+    # ------------------------------------------------------------
+    # Locate a Loan Requirement - Yes/No column, used to count "Leads" in
+    # the Location Summary sheet (Custom range only). Name match only —
+    # no letter fallback, since this column's position isn't fixed for
+    # this export. A row is counted as a lead if the value == "Yes"
+    # (case/whitespace-insensitive).
+    # ------------------------------------------------------------
+    loan_requirement_col = find_column_by_name(df, "Loan Requirement - Yes/No")
 
-    # Remove blank dates
+    # Remove rows where Lead Date or Lead Time failed to parse (LoginDate is NaT)
     df = df.dropna(subset=["LoginDate"])
 
     # Keep only CRM rows that fall within the selected date range
@@ -827,6 +892,12 @@ if uploaded_file:
     if geo_warning:
         st.warning(geo_warning)
 
+    if date_choice == "Custom range" and loan_requirement_col is None:
+        st.warning(
+            "Couldn't locate a 'Loan Requirement - Yes/No' column in the CRM file, "
+            "so the Leads count in the Location Summary sheet will show as 0."
+        )
+
     # Only count logins from the credit report that fall within the same
     # selected date range — not whichever date happens to dominate the file.
     if credit_file is not None:
@@ -848,6 +919,11 @@ if uploaded_file:
     summary = []
     matched_login_keys = set()
 
+    # Per-CM lookup keyed by (Territory, Cluster, lowercased EmployeeName),
+    # populated in the loop below and consumed later when building the
+    # Location Summary sheet.
+    daily_compliance_lookup = {}
+
     group_cols = [
         "Territory",
         "Cluster",
@@ -860,6 +936,17 @@ if uploaded_file:
 
         fh = grp[grp["Session"] == "FH"]
         sh = grp[grp["Session"] == "SH"]
+
+        # Working-day compliance count for this CM, used by the Location
+        # Summary sheet (Custom range only).
+        cm_key = (territory, cluster, str(emp).strip().lower())
+        compliant_days, non_compliant_days = daily_compliance_details(
+            fh, sh, working_dates
+        )
+        daily_compliance_lookup[cm_key] = {
+            "Compliant Days": compliant_days,
+            "Non-Compliant Days": non_compliant_days,
+        }
 
         # ---------------- FH ----------------
 
@@ -954,6 +1041,11 @@ if uploaded_file:
         else:
             compliance = "Non-Compliant"
 
+        total_non_compliances = daily_compliance_lookup.get(
+            cm_key,
+            {"Non-Compliant Days": working_days_count}
+        )["Non-Compliant Days"]
+
         # ---------------- Remarks ----------------
 
         remarks_list = []
@@ -1017,6 +1109,7 @@ if uploaded_file:
             employee_working_days,
             working_days_count,
             compliance,
+            total_non_compliances,
             remarks
         ])
 
@@ -1072,6 +1165,7 @@ if uploaded_file:
             0,        # Employee Working Days (no CRM activity)
             working_days_count,
             compliance,
+            working_days_count,
             "No CRM visit data for this employee — added from Credit Report."
         ])
 
@@ -1100,12 +1194,139 @@ if uploaded_file:
         "Employee Working Days",
         "Working Days Count",
         "Overall Compliance",
+        "Total Non-Compliances",
         "Remarks"
     ]
 
     summary_df = pd.DataFrame(summary, columns=cols)
     summary_df = summary_df.sort_values(["Territory", "Cluster", "CM Name"]).reset_index(drop=True)
     summary_df.insert(0, "S.No", range(1, len(summary_df) + 1))
+
+    # ------------------------------------------------------------
+    # Location Summary sheet — Custom range only.
+    # One row per CM/location. Compliance and non-compliance counts come
+    # from the same daily calculation used by Summary.
+    # ------------------------------------------------------------
+    location_df = None
+    location_merge_sizes = []
+
+    if date_choice == "Custom range":
+        if loan_requirement_col is not None:
+            df["_IsLead"] = (
+                df[loan_requirement_col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq("yes")
+            )
+        else:
+            df["_IsLead"] = False
+
+        cm_order = summary_df[["Territory", "Cluster", "CM Name"]].drop_duplicates()
+        location_rows = []
+        s_no = 0
+
+        for _, cm_row in cm_order.iterrows():
+            territory = cm_row["Territory"]
+            cluster = cm_row["Cluster"]
+            cm_name = cm_row["CM Name"]
+            cm_key = (territory, cluster, str(cm_name).strip().lower())
+
+            compliance_data = daily_compliance_lookup.get(
+                cm_key,
+                {
+                    "Compliant Days": 0,
+                    "Non-Compliant Days": working_days_count,
+                },
+            )
+
+            total_non_compliances = compliance_data["Non-Compliant Days"]
+
+            cm_df = df[
+                (df["Territory"] == territory)
+                & (df["Cluster"] == cluster)
+                & (df["EmployeeName"] == cm_name)
+            ].copy()
+
+            fh = cm_df[cm_df["Session"] == "FH"]
+            sh = cm_df[cm_df["Session"] == "SH"]
+
+            login_counts = login_lookup.get(
+                str(cm_name).strip().lower(),
+                {"FH": 0, "SH": 0},
+            )
+            fh_logins = int(login_counts.get("FH", 0))
+            sh_logins = int(login_counts.get("SH", 0))
+            total_logins = fh_logins + sh_logins
+
+            # Location-wise visit counts.
+            fh_location_counts = (
+                fh.groupby("City").size().to_dict()
+                if not fh.empty else {}
+            )
+            sh_location_counts = (
+                sh.groupby("City").size().to_dict()
+                if not sh.empty else {}
+            )
+
+            # Lead count by location: Loan Requirement - Yes/No == Yes.
+            lead_counts = (
+                cm_df[cm_df["_IsLead"]]
+                .groupby("City")
+                .size()
+                .to_dict()
+                if not cm_df.empty else {}
+            )
+
+            locations = sorted(
+                set(fh_location_counts.keys())
+                | set(sh_location_counts.keys()),
+                key=lambda x: str(x),
+            )
+
+            s_no += 1
+
+            if not locations:
+                location_rows.append([
+                    s_no, territory, cluster, cm_name,
+                    "", 0, 0, total_logins, total_non_compliances,
+                ])
+                location_merge_sizes.append(1)
+            else:
+                for location in locations:
+                    fh_visits = int(fh_location_counts.get(location, 0))
+                    sh_visits = int(sh_location_counts.get(location, 0))
+                    leads = int(lead_counts.get(location, 0))
+                    total_visits_loc = fh_visits + sh_visits
+
+                    location_rows.append([
+                        s_no,
+                        territory,
+                        cluster,
+                        cm_name,
+                        location,
+                        total_visits_loc,
+                        leads,
+                        total_logins,
+                        total_non_compliances,
+                    ])
+
+                location_merge_sizes.append(len(locations))
+
+        location_df = pd.DataFrame(
+            location_rows,
+            columns=[
+                "S.No",
+                "Territory",
+                "Cluster",
+                "CM Name",
+                "Locations Visited",
+                "Total Visits",
+                "Total Leads",
+                "Total Logins",
+                "Total Non-Compliances",
+            ],
+        )
 
     # Show first/last visit as time-only for a single-day range, but
     # include the date too when the range spans multiple days (since a
@@ -1210,6 +1431,34 @@ if uploaded_file:
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     # ============================================================
+    # Location-wise CRM report (Custom range only)
+    # ============================================================
+
+    if location_df is not None:
+        st.markdown('<div class="checkpoint-divider"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Location Summary — one row per location visited</div>', unsafe_allow_html=True)
+        st.caption(
+            "One row per location visited (FH and SH visits combined). "
+            "Total Leads are counted where Loan Requirement - Yes/No = \"Yes\". "
+            "Total Logins and Total Non-Compliances are per-CM figures "
+            "that repeat across the CM's location rows."
+        )
+
+        def style_non_compliance(val):
+            if isinstance(val, (int, float)) and val > 0:
+                return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
+            return ""
+
+        try:
+            styled_location = location_df.style.applymap(
+                style_non_compliance,
+                subset=["Total Non-Compliances"]
+            )
+            st.dataframe(styled_location, use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(location_df, use_container_width=True, hide_index=True)
+
+    # ============================================================
     # Write formatted Excel to memory (single source of truth for download)
     # ============================================================
 
@@ -1217,6 +1466,8 @@ if uploaded_file:
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        if location_df is not None:
+            location_df.to_excel(writer, index=False, sheet_name="Location Summary")
 
     output.seek(0)
 
@@ -1244,19 +1495,44 @@ if uploaded_file:
         bottom=thin
     )
 
-    # ==========================
-    # Header Formatting
-    # ==========================
+    def format_sheet(ws):
+        """Applies the shared header/border/autofit formatting to any sheet."""
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True
+            )
+            cell.border = border
 
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center",
-            wrap_text=True
-        )
-        cell.border = border
+        for row in range(2, ws.max_row + 1):
+            for col in range(1, ws.max_column + 1):
+                c = ws.cell(row=row, column=col)
+                c.border = border
+                c.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                    wrap_text=True
+                )
+
+        for column in ws.columns:
+            max_length = 0
+            column_letter = get_column_letter(column[0].column)
+            for cell in column:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except Exception:
+                    pass
+            ws.column_dimensions[column_letter].width = min(max_length + 3, 40)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        ws.row_dimensions[1].height = 35
+
+    format_sheet(ws)
 
     # ==========================
     # Column Numbers
@@ -1273,19 +1549,10 @@ if uploaded_file:
     sh_distance_col = headers["SH Distance (km)"]
 
     # ==========================
-    # Row Formatting
+    # Row Formatting (Summary sheet conditional colors)
     # ==========================
 
     for row in range(2, ws.max_row + 1):
-
-        for col in range(1, ws.max_column + 1):
-            c = ws.cell(row=row, column=col)
-            c.border = border
-            c.alignment = Alignment(
-                horizontal="center",
-                vertical="center",
-                wrap_text=True
-            )
 
         c = ws.cell(row=row, column=fh_status_col)
         c.fill = green_fill if c.value == "Met" else red_fill
@@ -1301,6 +1568,11 @@ if uploaded_file:
         elif c.value == "Non-Compliant":
             c.fill = red_fill
 
+        if "Total Non-Compliances" in headers:
+            c = ws.cell(row=row, column=headers["Total Non-Compliances"])
+            if isinstance(c.value, (int, float)) and c.value > 0:
+                c.fill = red_fill
+
         c = ws.cell(row=row, column=fh_distance_col)
         if c.value == DISTANCE_FLAG_LABEL:
             c.fill = red_fill
@@ -1310,29 +1582,51 @@ if uploaded_file:
             c.fill = red_fill
 
     # ==========================
-    # Auto Width
+    # Location Summary sheet formatting (Custom range only)
     # ==========================
 
-    for column in ws.columns:
-        max_length = 0
-        column_letter = get_column_letter(column[0].column)
+    if location_df is not None and "Location Summary" in wb.sheetnames:
+        ws_loc = wb["Location Summary"]
+        format_sheet(ws_loc)
 
-        for cell in column:
-            try:
-                if cell.value:
-                    max_length = max(max_length, len(str(cell.value)))
-            except Exception:
-                pass
+        loc_headers = {}
+        for cell in ws_loc[1]:
+            loc_headers[cell.value] = cell.column
 
-        ws.column_dimensions[column_letter].width = min(max_length + 3, 40)
+        non_compliance_col = loc_headers.get("Total Non-Compliances")
 
-    # ==========================
-    # Freeze Header / Auto Filter / Row Height
-    # ==========================
+        # Merge CM-level columns down each CM's location block.
+        merge_cols = [
+            loc_headers.get(name)
+            for name in (
+                "S.No", "Territory", "Cluster", "CM Name",
+                "Total Logins", "Total Non-Compliances",
+            )
+            if loc_headers.get(name)
+        ]
 
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    ws.row_dimensions[1].height = 35
+        current_row = 2
+        for group_size in location_merge_sizes:
+            end_row = current_row + group_size - 1
+
+            if non_compliance_col:
+                top_cell = ws_loc.cell(row=current_row, column=non_compliance_col)
+                if isinstance(top_cell.value, (int, float)) and top_cell.value > 0:
+                    for r in range(current_row, end_row + 1):
+                        ws_loc.cell(row=r, column=non_compliance_col).fill = red_fill
+
+            if group_size > 1:
+                for col in merge_cols:
+                    ws_loc.merge_cells(
+                        start_row=current_row, start_column=col,
+                        end_row=end_row, end_column=col
+                    )
+                    top_cell = ws_loc.cell(row=current_row, column=col)
+                    top_cell.alignment = Alignment(
+                        horizontal="center", vertical="center", wrap_text=True
+                    )
+
+            current_row = end_row + 1
 
     # ==========================
     # Save formatted workbook back to memory for download
