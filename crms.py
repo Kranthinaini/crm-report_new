@@ -801,9 +801,25 @@ if uploaded_file:
     # time-of-day is meaningful. The rest of the app refers to the combined,
     # correct visit timestamp internally as "LoginDate": Lead Date's date +
     # Lead Time's time-of-day.
+    #
+    # "Lead Time" can arrive in two different shapes depending on the
+    # source file: as a pure time-of-day value (pandas/openpyxl read this
+    # as a timedelta64 when Excel stores it as a time-only cell), or as a
+    # full datetime/text timestamp (handled by normalize_to_ist, as
+    # before). Treating a timedelta column as if it were a datetime (the
+    # old behavior) makes pd.to_datetime silently return NaT for every
+    # row, which then wipes out the entire file once LoginDate rows with
+    # NaT are dropped further down — so detect which shape we have and
+    # extract the time-of-day component accordingly.
     _lead_date = normalize_to_ist(df["Lead Date"])
-    _lead_time = normalize_to_ist(df["Lead Time"])
-    df["LoginDate"] = _lead_date.dt.normalize() + (_lead_time - _lead_time.dt.normalize())
+
+    if pd.api.types.is_timedelta64_dtype(df["Lead Time"]):
+        _lead_time_of_day = df["Lead Time"]
+    else:
+        _lead_time = normalize_to_ist(df["Lead Time"])
+        _lead_time_of_day = _lead_time - _lead_time.dt.normalize()
+
+    df["LoginDate"] = _lead_date.dt.normalize() + _lead_time_of_day
 
     # ------------------------------------------------------------
     # Locate latitude/longitude columns for distance-covered calc.
