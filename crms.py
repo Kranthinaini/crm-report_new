@@ -256,7 +256,7 @@ with upload_col1:
     uploaded_file = st.file_uploader(
         "Upload CRM file (.xlsx or .csv)",
         type=["xlsx", "csv"],
-        help="Expects columns: Territory, Cluster, EmployeeName, City, Lead Date, Lead Time",
+        help="Expects columns: Territory, Cluster, EmployeeName, City, Lead Date, Lead Time (optionally DM Name)",
         key="crm_uploader"
     )
 
@@ -323,6 +323,47 @@ DISTANCE_FLAG_LABEL = ">200 km"
 # missing/unparseable coordinates) are treated as an invalid location.
 INDIA_LAT_MIN, INDIA_LAT_MAX = 6.5, 37.6
 INDIA_LON_MIN, INDIA_LON_MAX = 68.0, 97.5
+
+# Columns that get summed into each DM's subtotal row and the grand
+# total row (see "DM-wise subtotal rows" block below).
+DM_TOTAL_SUM_COLS = [
+    "Logins",
+    "SH Logins",
+    "Total Logins",
+]
+
+# ------------------------------------------------------------
+# Territory -> DM Name mapping.
+# Neither the CRM export nor the credit report carries a DM Name column,
+# so DM Name is derived from each row's Territory using this fixed table
+# instead. Update this dict whenever territories are added/reassigned to
+# a different DM. Matching is case/whitespace-insensitive; any Territory
+# not listed here falls back to "Unassigned" and is flagged with a
+# one-time warning so it's easy to spot a missing mapping.
+# ------------------------------------------------------------
+TERRITORY_TO_DM = {
+    "khammam": "Anji",
+    "suryapet": "Anji",
+    "nalgonda": "Anji",
+    "mahabubnagar": "Anji",
+    "wanaparthy": "Anji",
+    "nagarkurnool": "Anji",
+    "jagityal": "Ravoof",
+    "karimnagar": "Ravoof",
+    "mancherial": "Ravoof",
+    "nizamabad": "Ravoof",
+    "warangal": "Ravoof",
+    "narsampet": "Ravoof",
+    "vijayawada": "Vijayawada",
+}
+
+
+def get_dm_name(territory):
+    """Looks up the DM Name for a Territory via TERRITORY_TO_DM (case/whitespace
+    -insensitive). Returns 'Unassigned' if the territory isn't in the table."""
+    if pd.isna(territory):
+        return "Unassigned"
+    return TERRITORY_TO_DM.get(str(territory).strip().lower(), "Unassigned")
 
 if date_from == date_to:
     st.caption(f"Showing visits for: {date_from.strftime('%d-%b-%Y')}")
@@ -680,9 +721,10 @@ def build_login_lookup(credit_file, date_from, date_to):
     Date Time' falls within [date_from, date_to] (inclusive, IST), and
     returns (login_lookup, warning). login_lookup maps a normalized
     CL Name -> {"FH": n, "SH": n, "DisplayName": ..., "Territory": ...,
-    "Cluster": ...}. Territory/Cluster/DisplayName are carried along so
-    that employees present only in the credit report (no matching CM in
-    the CRM file) can still be listed in the summary.
+    "Cluster": ..., "DM Name": ...}. Territory/Cluster/DisplayName/DM
+    Name are carried along so that employees present only in the credit
+    report (no matching CM in the CRM file) can still be listed in the
+    summary.
     """
     lookup = {}
     warning = None
@@ -752,6 +794,9 @@ def build_login_lookup(credit_file, date_from, date_to):
     credit_df["_Cluster"] = (
         credit_df[cluster_col].astype(str).str.strip() if cluster_col else ""
     )
+    credit_df["_DMName"] = (
+        credit_df["_Territory"].apply(get_dm_name) if territory_col else "Unassigned"
+    )
 
     counts = (
         credit_df.groupby(["_NameKey", "_Session"])
@@ -759,7 +804,7 @@ def build_login_lookup(credit_file, date_from, date_to):
         .unstack(fill_value=0)
     )
     meta = credit_df.groupby("_NameKey").agg(
-        {"_DisplayName": "first", "_Territory": "first", "_Cluster": "first"}
+        {"_DisplayName": "first", "_Territory": "first", "_Cluster": "first", "_DMName": "first"}
     )
 
     for name_key in counts.index:
@@ -771,6 +816,7 @@ def build_login_lookup(credit_file, date_from, date_to):
             "DisplayName": m["_DisplayName"],
             "Territory": m["_Territory"],
             "Cluster": m["_Cluster"],
+            "DM Name": m["_DMName"],
         }
 
     return lookup, warning
@@ -794,6 +840,24 @@ if uploaded_file:
             f"Found columns: {', '.join(df.columns)}"
         )
         st.stop()
+
+    # DM Name isn't present in the CRM export, so it's derived from each
+    # row's Territory via TERRITORY_TO_DM instead. The Summary sheet is
+    # grouped by the resulting DM with a subtotal row after each DM's
+    # rows, plus a Grand Total row at the end.
+    has_dm = True
+    df["DM Name"] = df["Territory"].apply(get_dm_name)
+
+    unmapped_territories = sorted(
+        t for t in df.loc[df["DM Name"] == "Unassigned", "Territory"].astype(str).str.strip().unique()
+        if t
+    )
+    if unmapped_territories:
+        st.warning(
+            f"No DM mapping found for territory/territories: {', '.join(unmapped_territories)}. "
+            f"These rows are grouped under 'Unassigned' — add them to TERRITORY_TO_DM in the "
+            f"script to assign the correct DM."
+        )
 
     # "Lead Date" carries the actual visit date; "Lead Time" is a separate
     # submission timestamp whose date part is just whenever the row was
@@ -940,15 +1004,19 @@ if uploaded_file:
     # Location Summary sheet.
     daily_compliance_lookup = {}
 
-    group_cols = [
-        "Territory",
-        "Cluster",
-        "EmployeeName"
-    ]
+    group_cols = (
+        ["DM Name", "Territory", "Cluster", "EmployeeName"]
+        if has_dm else
+        ["Territory", "Cluster", "EmployeeName"]
+    )
 
     for key, grp in df.groupby(group_cols):
 
-        territory, cluster, emp = key
+        if has_dm:
+            dm_name, territory, cluster, emp = key
+        else:
+            dm_name = ""
+            territory, cluster, emp = key
 
         fh = grp[grp["Session"] == "FH"]
         sh = grp[grp["Session"] == "SH"]
@@ -1101,6 +1169,7 @@ if uploaded_file:
         remarks = " ".join(remarks_list)
 
         summary.append([
+            dm_name,
             territory,
             cluster,
             emp,
@@ -1157,6 +1226,7 @@ if uploaded_file:
             compliance = "Non-Compliant"
 
         summary.append([
+            (info.get("DM Name", "") or "") if has_dm else "",
             info.get("Territory", "") or "",
             info.get("Cluster", "") or "",
             info.get("DisplayName", name_key),
@@ -1186,6 +1256,7 @@ if uploaded_file:
         ])
 
     cols = [
+        "DM Name",
         "Territory",
         "Cluster",
         "CM Name",
@@ -1215,13 +1286,92 @@ if uploaded_file:
     ]
 
     summary_df = pd.DataFrame(summary, columns=cols)
-    summary_df = summary_df.sort_values(["Territory", "Cluster", "CM Name"]).reset_index(drop=True)
-    summary_df.insert(0, "S.No", range(1, len(summary_df) + 1))
+
+    if not has_dm:
+        # No DM Name column found in the source file — drop it rather
+        # than showing an empty column.
+        summary_df = summary_df.drop(columns=["DM Name"])
+        sort_cols = ["Territory", "Cluster", "CM Name"]
+    else:
+        sort_cols = ["DM Name", "Territory", "Cluster", "CM Name"]
+
+    summary_df = summary_df.sort_values(sort_cols).reset_index(drop=True)
+
+    # Show first/last visit as time-only for a single-day range, but
+    # include the date too when the range spans multiple days (since a
+    # bare "HH:MM" would be ambiguous about which day it refers to).
+    time_cols = [
+        "FH First Visit",
+        "FH Last Visit",
+        "SH First Visit",
+        "SH Last Visit"
+    ]
+
+    time_format = "%H:%M" if date_from == date_to else "%d-%b %H:%M"
+
+    for col in time_cols:
+        summary_df[col] = pd.to_datetime(
+            summary_df[col],
+            errors="coerce"
+        ).dt.strftime(time_format).fillna("")
+
+    # ------------------------------------------------------------
+    # DM-wise subtotal rows + Grand Total row (Summary sheet only).
+    # Only added when a "DM Name" column was found in the CRM file.
+    # A subtotal row is inserted after each DM's block of CM rows,
+    # labeled "DM-1 Total", "DM-2 Total", ... in the S.No column, with
+    # the numeric columns in DM_TOTAL_SUM_COLS summed for that DM.
+    # A final "Grand Total" row sums those same columns across every
+    # DM. All other columns are left blank on total rows.
+    # ------------------------------------------------------------
+    if has_dm:
+        blank_row = {c: "" for c in summary_df.columns}
+
+        final_rows = []
+        grand_totals = {c: 0 for c in DM_TOTAL_SUM_COLS}
+        dm_index = 0
+
+        for dm_name, dm_group in summary_df.groupby("DM Name", sort=False):
+            for _, r in dm_group.iterrows():
+                final_rows.append(r.to_dict())
+
+            dm_index += 1
+            total_row = dict(blank_row)
+            total_row["S.No"] = f"DM-{dm_index} Total"
+            for c in DM_TOTAL_SUM_COLS:
+                dm_sum = int(pd.to_numeric(dm_group[c], errors="coerce").fillna(0).sum())
+                total_row[c] = dm_sum
+                grand_totals[c] += dm_sum
+            final_rows.append(total_row)
+
+        grand_total_row = dict(blank_row)
+        grand_total_row["S.No"] = "Grand Total"
+        for c in DM_TOTAL_SUM_COLS:
+            grand_total_row[c] = grand_totals[c]
+        final_rows.append(grand_total_row)
+
+        summary_df = pd.DataFrame(final_rows, columns=["S.No"] + list(summary_df.columns))
+
+        # Renumber only the real CM rows sequentially; total rows keep
+        # their text label.
+        running_no = 0
+        new_sno = []
+        for val in summary_df["S.No"]:
+            if isinstance(val, str) and val.endswith("Total"):
+                new_sno.append(val)
+            else:
+                running_no += 1
+                new_sno.append(running_no)
+        summary_df["S.No"] = new_sno
+    else:
+        summary_df.insert(0, "S.No", range(1, len(summary_df) + 1))
 
     # ------------------------------------------------------------
     # Location Summary sheet — Custom range only.
     # One row per CM/location. Compliance and non-compliance counts come
-    # from the same daily calculation used by Summary.
+    # from the same daily calculation used by Summary. DM Name is carried
+    # along from the Summary sheet and DM-wise subtotal + Grand Total
+    # rows are appended, mirroring the Summary sheet's layout.
     # ------------------------------------------------------------
     location_df = None
     location_merge_sizes = []
@@ -1238,11 +1388,19 @@ if uploaded_file:
         else:
             df["_IsLead"] = False
 
-        cm_order = summary_df[["Territory", "Cluster", "CM Name"]].drop_duplicates()
+        cm_cols = (
+            ["DM Name", "Territory", "Cluster", "CM Name"]
+            if has_dm else
+            ["Territory", "Cluster", "CM Name"]
+        )
+        cm_order = summary_df[
+            summary_df["S.No"].apply(lambda v: not (isinstance(v, str) and v.endswith("Total")))
+        ][cm_cols].drop_duplicates()
         location_rows = []
         s_no = 0
 
         for _, cm_row in cm_order.iterrows():
+            dm_name = cm_row["DM Name"] if has_dm else ""
             territory = cm_row["Territory"]
             cluster = cm_row["Cluster"]
             cm_name = cm_row["CM Name"]
@@ -1303,10 +1461,11 @@ if uploaded_file:
             s_no += 1
 
             if not locations:
-                location_rows.append([
-                    s_no, territory, cluster, cm_name,
-                    "", 0, 0, total_logins, total_non_compliances,
-                ])
+                row = [s_no]
+                if has_dm:
+                    row.append(dm_name)
+                row += [territory, cluster, cm_name, "", 0, 0, total_logins, total_non_compliances]
+                location_rows.append(row)
                 location_merge_sizes.append(1)
             else:
                 for location in locations:
@@ -1315,8 +1474,10 @@ if uploaded_file:
                     leads = int(lead_counts.get(location, 0))
                     total_visits_loc = fh_visits + sh_visits
 
-                    location_rows.append([
-                        s_no,
+                    row = [s_no]
+                    if has_dm:
+                        row.append(dm_name)
+                    row += [
                         territory,
                         cluster,
                         cm_name,
@@ -1325,42 +1486,80 @@ if uploaded_file:
                         leads,
                         total_logins,
                         total_non_compliances,
-                    ])
+                    ]
+                    location_rows.append(row)
 
                 location_merge_sizes.append(len(locations))
 
-        location_df = pd.DataFrame(
-            location_rows,
-            columns=[
-                "S.No",
-                "Territory",
-                "Cluster",
-                "CM Name",
-                "Locations Visited",
-                "Total Visits",
-                "Total Leads",
-                "Total Logins",
-                "Total Non-Compliances",
-            ],
-        )
+        loc_cols = ["S.No"]
+        if has_dm:
+            loc_cols.append("DM Name")
+        loc_cols += [
+            "Territory",
+            "Cluster",
+            "CM Name",
+            "Locations Visited",
+            "Total Visits",
+            "Total Leads",
+            "Total Logins",
+            "Total Non-Compliances",
+        ]
 
-    # Show first/last visit as time-only for a single-day range, but
-    # include the date too when the range spans multiple days (since a
-    # bare "HH:MM" would be ambiguous about which day it refers to).
-    time_cols = [
-        "FH First Visit",
-        "FH Last Visit",
-        "SH First Visit",
-        "SH Last Visit"
-    ]
+        location_df = pd.DataFrame(location_rows, columns=loc_cols)
 
-    time_format = "%H:%M" if date_from == date_to else "%d-%b %H:%M"
+        # ------------------------------------------------------------
+        # DM-wise subtotal rows + Grand Total row, mirroring the Summary
+        # sheet. "Total Visits" / "Total Leads" are per-location figures,
+        # so they're summed straight across every location row for the
+        # DM. "Total Logins" / "Total Non-Compliances" are per-CM
+        # figures that repeat across a CM's location rows, so those are
+        # summed once per unique CM instead of once per row (to avoid
+        # double-counting a CM with multiple locations).
+        # ------------------------------------------------------------
+        if has_dm and not location_df.empty:
+            blank_row = {c: "" for c in location_df.columns}
+            final_rows = []
+            new_merge_sizes = []
+            grand_totals = {
+                "Total Visits": 0,
+                "Total Leads": 0,
+                "Total Logins": 0,
+                "Total Non-Compliances": 0,
+            }
+            dm_index = 0
 
-    for col in time_cols:
-        summary_df[col] = pd.to_datetime(
-            summary_df[col],
-            errors="coerce"
-        ).dt.strftime(time_format).fillna("")
+            for dm_name_val, dm_group in location_df.groupby("DM Name", sort=False):
+                for _, cm_group in dm_group.groupby("S.No", sort=False):
+                    for _, r in cm_group.iterrows():
+                        final_rows.append(r.to_dict())
+                    new_merge_sizes.append(len(cm_group))
+
+                dm_index += 1
+                total_row = dict(blank_row)
+                total_row["S.No"] = f"DM-{dm_index} Total"
+                total_row["DM Name"] = dm_name_val
+                total_row["Total Visits"] = int(dm_group["Total Visits"].sum())
+                total_row["Total Leads"] = int(dm_group["Total Leads"].sum())
+
+                cm_unique = dm_group.drop_duplicates(subset=["Territory", "Cluster", "CM Name"])
+                total_row["Total Logins"] = int(cm_unique["Total Logins"].sum())
+                total_row["Total Non-Compliances"] = int(cm_unique["Total Non-Compliances"].sum())
+
+                for k in grand_totals:
+                    grand_totals[k] += total_row[k]
+
+                final_rows.append(total_row)
+                new_merge_sizes.append(1)
+
+            grand_total_row = dict(blank_row)
+            grand_total_row["S.No"] = "Grand Total"
+            for k, v in grand_totals.items():
+                grand_total_row[k] = v
+            final_rows.append(grand_total_row)
+            new_merge_sizes.append(1)
+
+            location_df = pd.DataFrame(final_rows, columns=loc_cols)
+            location_merge_sizes = new_merge_sizes
 
     # Let the user know if some credit-report logins had no matching CM in
     # the CRM file — they've been added as extra rows above/below using
@@ -1379,10 +1578,13 @@ if uploaded_file:
     # KPI strip
     # ============================================================
 
-    total_cms = len(summary_df)
-    full_count = int((summary_df["Overall Compliance"] == "Fully Compliant").sum())
-    partial_count = int((summary_df["Overall Compliance"] == "Partially Compliant").sum())
-    non_count = int((summary_df["Overall Compliance"] == "Non-Compliant").sum())
+    is_total_row_mask = summary_df["S.No"].apply(lambda v: isinstance(v, str) and v.endswith("Total"))
+    cm_rows_df = summary_df[~is_total_row_mask]
+
+    total_cms = len(cm_rows_df)
+    full_count = int((cm_rows_df["Overall Compliance"] == "Fully Compliant").sum())
+    partial_count = int((cm_rows_df["Overall Compliance"] == "Partially Compliant").sum())
+    non_count = int((cm_rows_df["Overall Compliance"] == "Non-Compliant").sum())
 
     def pct(n):
         return f"{(n / total_cms * 100):.0f}%" if total_cms else "0%"
@@ -1418,7 +1620,8 @@ if uploaded_file:
     # Table preview
     # ============================================================
 
-    st.markdown('<div class="section-label">Summary — one row per CM</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">Summary — one row per CM, with DM-wise subtotals</div>' if has_dm
+                else '<div class="section-label">Summary — one row per CM</div>', unsafe_allow_html=True)
 
     def style_status(val):
         if val in ("Met", "Fully Compliant"):
@@ -1431,6 +1634,14 @@ if uploaded_file:
             return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
         return ""
 
+    def style_total_rows(row):
+        is_total = isinstance(row["S.No"], str) and row["S.No"].endswith("Total")
+        if is_total:
+            fill = "background-color:#FFF2CC; font-weight:700;" if row["S.No"] == "Grand Total" \
+                else "background-color:#FDEBD0; font-weight:700;"
+            return [fill] * len(row)
+        return [""] * len(row)
+
     try:
         styled = summary_df.style.applymap(
             style_status,
@@ -1442,6 +1653,8 @@ if uploaded_file:
                 "SH Distance (km)",
             ]
         )
+        if has_dm:
+            styled = styled.apply(style_total_rows, axis=1)
         st.dataframe(styled, use_container_width=True, hide_index=True)
     except Exception:
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
@@ -1452,7 +1665,8 @@ if uploaded_file:
 
     if location_df is not None:
         st.markdown('<div class="checkpoint-divider"></div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-label">Location Summary — one row per location visited</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Location Summary — one row per location visited, with DM-wise subtotals</div>' if has_dm
+                    else '<div class="section-label">Location Summary — one row per location visited</div>', unsafe_allow_html=True)
         st.caption(
             "One row per location visited (FH and SH visits combined). "
             "Total Leads are counted where Loan Requirement - Yes/No = \"Yes\". "
@@ -1465,11 +1679,21 @@ if uploaded_file:
                 return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
             return ""
 
+        def style_location_total_rows(row):
+            is_total = isinstance(row["S.No"], str) and row["S.No"].endswith("Total")
+            if is_total:
+                fill = "background-color:#FFF2CC; font-weight:700;" if row["S.No"] == "Grand Total" \
+                    else "background-color:#FDEBD0; font-weight:700;"
+                return [fill] * len(row)
+            return [""] * len(row)
+
         try:
             styled_location = location_df.style.applymap(
                 style_non_compliance,
                 subset=["Total Non-Compliances"]
             )
+            if has_dm:
+                styled_location = styled_location.apply(style_location_total_rows, axis=1)
             st.dataframe(styled_location, use_container_width=True, hide_index=True)
         except Exception:
             st.dataframe(location_df, use_container_width=True, hide_index=True)
@@ -1499,10 +1723,13 @@ if uploaded_file:
     green_fill = PatternFill(fill_type="solid", fgColor="C6EFCE")
     red_fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
     yellow_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
+    dm_total_fill = PatternFill(fill_type="solid", fgColor="FFC000")   # Orange — DM subtotal rows
+    grand_total_fill = PatternFill(fill_type="solid", fgColor="FAC090")  # Peach/gold — Grand Total row
 
     header_font = Font(color="FFFFFF", bold=True)
+    bold_font = Font(bold=True)
 
-    thin = Side(border_style="thin", color="D9D9D9")
+    thin = Side(border_style="thin", color="000000")
 
     border = Border(
         left=thin,
@@ -1563,12 +1790,27 @@ if uploaded_file:
     overall_col = headers["Overall Compliance"]
     fh_distance_col = headers["FH Distance (km)"]
     sh_distance_col = headers["SH Distance (km)"]
+    sno_col = headers["S.No"]
 
     # ==========================
     # Row Formatting (Summary sheet conditional colors)
     # ==========================
 
     for row in range(2, ws.max_row + 1):
+
+        sno_val = ws.cell(row=row, column=sno_col).value
+        is_dm_total = isinstance(sno_val, str) and sno_val.startswith("DM-") and sno_val.endswith("Total")
+        is_grand_total = sno_val == "Grand Total"
+
+        if is_dm_total or is_grand_total:
+            fill = grand_total_fill if is_grand_total else dm_total_fill
+            for col in range(1, ws.max_column + 1):
+                c = ws.cell(row=row, column=col)
+                c.fill = fill
+                c.font = bold_font
+                c.border = border
+            # Skip the per-status conditional coloring below for total rows
+            continue
 
         c = ws.cell(row=row, column=fh_status_col)
         c.fill = green_fill if c.value == "Met" else red_fill
@@ -1610,12 +1852,13 @@ if uploaded_file:
             loc_headers[cell.value] = cell.column
 
         non_compliance_col = loc_headers.get("Total Non-Compliances")
+        loc_sno_col = loc_headers.get("S.No")
 
-        # Merge CM-level columns down each CM's location block.
+        # Merge CM-level (and DM-level) columns down each CM's location block.
         merge_cols = [
             loc_headers.get(name)
             for name in (
-                "S.No", "Territory", "Cluster", "CM Name",
+                "S.No", "DM Name", "Territory", "Cluster", "CM Name",
                 "Total Logins", "Total Non-Compliances",
             )
             if loc_headers.get(name)
@@ -1624,6 +1867,20 @@ if uploaded_file:
         current_row = 2
         for group_size in location_merge_sizes:
             end_row = current_row + group_size - 1
+
+            sno_val = ws_loc.cell(row=current_row, column=loc_sno_col).value if loc_sno_col else None
+            is_dm_total = isinstance(sno_val, str) and sno_val.startswith("DM-") and sno_val.endswith("Total")
+            is_grand_total = sno_val == "Grand Total"
+
+            if is_dm_total or is_grand_total:
+                fill = grand_total_fill if is_grand_total else dm_total_fill
+                for col in range(1, ws_loc.max_column + 1):
+                    c = ws_loc.cell(row=current_row, column=col)
+                    c.fill = fill
+                    c.font = bold_font
+                    c.border = border
+                current_row = end_row + 1
+                continue
 
             if non_compliance_col:
                 top_cell = ws_loc.cell(row=current_row, column=non_compliance_col)
