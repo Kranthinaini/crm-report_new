@@ -572,6 +572,17 @@ def daily_compliance_details(fh_df, sh_df, working_dates):
     A day is compliant only when both FH and SH meet the 2-hour target.
     The same result is used by Summary and Location Summary so their
     compliant/non-compliant counts always match.
+
+    Also tracks, per working day, whether FH and/or SH individually missed
+    the 2-hour target (FH Not Met Count / SH Not Met Count — these count
+    every day the given half fell short, regardless of the other half's
+    status), and rolls the day-level outcomes into a single weighted
+    "Score": each Non-Compliant day contributes 2 points and each
+    Partially Compliant day contributes 1 point (Fully Compliant days
+    contribute 0).
+
+    Returns a dict with keys: "Compliant Days", "Partially Compliant Days",
+    "Non-Compliant Days", "FH Not Met Count", "SH Not Met Count", "Score".
     """
     threshold = HOURS_PER_DAY_PER_HALF * 60
 
@@ -588,26 +599,45 @@ def daily_compliance_details(fh_df, sh_df, working_dates):
     )
 
     compliant_days = 0
+    partially_compliant_days = 0
     non_compliant_days = 0
+    fh_not_met_count = 0
+    sh_not_met_count = 0
 
     for d in working_dates:
         fh_minutes = fh_daily.get(d, 0)
         sh_minutes = sh_daily.get(d, 0)
 
-        if fh_minutes >= threshold and sh_minutes >= threshold:
+        fh_met = fh_minutes >= threshold
+        sh_met = sh_minutes >= threshold
+
+        if not fh_met:
+            fh_not_met_count += 1
+        if not sh_met:
+            sh_not_met_count += 1
+
+        if fh_met and sh_met:
             # Fully Compliant
             compliant_days += 1
 
-        elif fh_minutes < threshold and sh_minutes < threshold:
+        elif not fh_met and not sh_met:
             # Non-Compliant
             non_compliant_days += 1
 
         else:
             # Partially Compliant
-            # Do not count as Non-Compliant
-            pass
+            partially_compliant_days += 1
 
-    return compliant_days, non_compliant_days
+    score = (non_compliant_days * 2) + (partially_compliant_days * 1)
+
+    return {
+        "Compliant Days": compliant_days,
+        "Partially Compliant Days": partially_compliant_days,
+        "Non-Compliant Days": non_compliant_days,
+        "FH Not Met Count": fh_not_met_count,
+        "SH Not Met Count": sh_not_met_count,
+        "Score": score,
+    }
 
 
 # ============================================================
@@ -690,6 +720,50 @@ def first_last_distance(session_df, lat_col, lon_col):
         return 0.0, True
 
     return haversine_km(lat1, lon1, lat2, lon2), False
+
+
+def location_coverage_distance(loc_df, lat_col, lon_col):
+    """
+    Computes a coverage-radius distance for one CM's visits to a single
+    location: finds the centroid (average lat/lon) of every valid ping
+    recorded there, then returns the farthest distance from that centroid
+    to any individual ping — i.e. how far out the CM's visits to that
+    location actually spread, rather than the distance between just the
+    first and last visit (which can understate or misrepresent movement
+    if the CM zig-zagged, or go blank if either endpoint's coordinate was
+    bad).
+
+    Returns (distance_km, valid_point_count):
+    - valid_point_count is how many of the location's pings had usable
+      (in-India, non-missing) coordinates. 0 means nothing could be
+      computed (show blank); 1 means only a single usable ping (radius
+      is 0.0, nothing to spread); 2+ means distance_km is the radius
+      around the centroid of those points.
+    """
+    if loc_df.empty or lat_col is None or lon_col is None:
+        return 0.0, 0
+
+    valid_pts = [
+        (row[lat_col], row[lon_col])
+        for _, row in loc_df.iterrows()
+        if is_valid_india_coord(row[lat_col], row[lon_col])
+    ]
+
+    n = len(valid_pts)
+    if n == 0:
+        return 0.0, 0
+    if n == 1:
+        return 0.0, 1
+
+    centroid_lat = sum(p[0] for p in valid_pts) / n
+    centroid_lon = sum(p[1] for p in valid_pts) / n
+
+    radius = max(
+        haversine_km(centroid_lat, centroid_lon, lat, lon)
+        for lat, lon in valid_pts
+    )
+
+    return radius, n
 
 
 def format_distance(km_value):
@@ -924,6 +998,19 @@ if uploaded_file:
     # ------------------------------------------------------------
     loan_requirement_col = find_column_by_name(df, "Loan Requirement - Yes/No")
 
+    # ------------------------------------------------------------
+    # Locate a "Relationship with Customer" column and a "Customer Type"
+    # column, used for two additional per-location counts in the
+    # Location Summary sheet (Custom range only). Name match only — no
+    # letter fallback, since these columns' positions aren't fixed for
+    # this export. A row counts toward Relationship with Customer Count
+    # if the value == "Yes" (case/whitespace-insensitive), and toward
+    # New Customer Count if Customer Type == "New Customer"
+    # (case/whitespace-insensitive).
+    # ------------------------------------------------------------
+    relationship_col = find_column_by_name(df, "Relation with Customer")
+    customer_type_col = find_column_by_name(df, "Customer Type")
+
     # Remove rows where Lead Date or Lead Time failed to parse (LoginDate is NaT)
     df = df.dropna(subset=["LoginDate"])
 
@@ -978,6 +1065,19 @@ if uploaded_file:
             "so the Leads count in the Location Summary sheet will show as 0."
         )
 
+    if date_choice == "Custom range" and relationship_col is None:
+        st.warning(
+            "Couldn't locate a 'Relationship with Customer' column in the CRM file, "
+            "so the Relationship with Customer Count in the Location Summary sheet "
+            "will show as 0."
+        )
+
+    if date_choice == "Custom range" and customer_type_col is None:
+        st.warning(
+            "Couldn't locate a 'Customer Type' column in the CRM file, "
+            "so the New Customer Count in the Location Summary sheet will show as 0."
+        )
+
     # Only count logins from the credit report that fall within the same
     # selected date range — not whichever date happens to dominate the file.
     if credit_file is not None:
@@ -1024,13 +1124,8 @@ if uploaded_file:
         # Working-day compliance count for this CM, used by the Location
         # Summary sheet (Custom range only).
         cm_key = (territory, cluster, str(emp).strip().lower())
-        compliant_days, non_compliant_days = daily_compliance_details(
-            fh, sh, working_dates
-        )
-        daily_compliance_lookup[cm_key] = {
-            "Compliant Days": compliant_days,
-            "Non-Compliant Days": non_compliant_days,
-        }
+        compliance_details = daily_compliance_details(fh, sh, working_dates)
+        daily_compliance_lookup[cm_key] = compliance_details
 
         # ---------------- FH ----------------
 
@@ -1125,10 +1220,11 @@ if uploaded_file:
         else:
             compliance = "Non-Compliant"
 
-        total_non_compliances = daily_compliance_lookup.get(
-            cm_key,
-            {"Non-Compliant Days": working_days_count}
-        )["Non-Compliant Days"]
+        fh_not_met_count = compliance_details["FH Not Met Count"]
+        sh_not_met_count = compliance_details["SH Not Met Count"]
+        partially_compliant_count = compliance_details["Partially Compliant Days"]
+        non_compliant_count = compliance_details["Non-Compliant Days"]
+        total_non_compliance_score = compliance_details["Score"]
 
         # ---------------- Remarks ----------------
 
@@ -1179,6 +1275,7 @@ if uploaded_file:
             fh_last,
             fh_duration,
             fh_status,
+            fh_not_met_count,
             fh_logins,
             fh_distance_display,
             sh_locations,
@@ -1187,6 +1284,7 @@ if uploaded_file:
             sh_last,
             sh_duration,
             sh_status,
+            sh_not_met_count,
             sh_logins,
             sh_distance_display,
             total,
@@ -1194,7 +1292,9 @@ if uploaded_file:
             employee_working_days,
             working_days_count,
             compliance,
-            total_non_compliances,
+            partially_compliant_count,
+            non_compliant_count,
+            total_non_compliance_score,
             remarks
         ])
 
@@ -1236,6 +1336,7 @@ if uploaded_file:
             pd.NaT,   # FH Last Visit
             "00:00",  # FH Duration
             fh_status,
+            working_days_count,  # FH Not Met Count (no CRM visits => every working day not met)
             fh_logins,
             0.0,      # FH Distance (km)
             "",       # SH Locations Visited
@@ -1244,6 +1345,7 @@ if uploaded_file:
             pd.NaT,   # SH Last Visit
             "00:00",  # SH Duration
             sh_status,
+            working_days_count,  # SH Not Met Count (no CRM visits => every working day not met)
             sh_logins,
             0.0,      # SH Distance (km)
             0,        # Total Visits (Day)
@@ -1251,7 +1353,9 @@ if uploaded_file:
             0,        # Employee Working Days (no CRM activity)
             working_days_count,
             compliance,
-            working_days_count,
+            0,                        # Partially Compliant Count (no CRM visits => none partially compliant)
+            working_days_count,       # Non-Compliant Count (every working day Non-Compliant)
+            working_days_count * 2,  # Total Non-Compliance Score (every working day Non-Compliant = 2 pts)
             "No CRM visit data for this employee — added from Credit Report."
         ])
 
@@ -1266,6 +1370,7 @@ if uploaded_file:
         "FH Last Visit",
         "FH Duration",
         "FH Status",
+        "FH Not Met Count",
         "Logins",
         "FH Distance (km)",
         "SH Locations Visited",
@@ -1274,6 +1379,7 @@ if uploaded_file:
         "SH Last Visit",
         "SH Duration",
         "SH Status",
+        "SH Not Met Count",
         "SH Logins",
         "SH Distance (km)",
         "Total Visits (Day)",
@@ -1281,7 +1387,9 @@ if uploaded_file:
         "Employee Working Days",
         "Working Days Count",
         "Overall Compliance",
-        "Total Non-Compliances",
+        "Partially Compliant Count",
+        "Non-Compliant Count",
+        "Total Non-Compliance Score",
         "Remarks"
     ]
 
@@ -1388,6 +1496,28 @@ if uploaded_file:
         else:
             df["_IsLead"] = False
 
+        if relationship_col is not None:
+            df["_IsRelationship"] = (
+                df[relationship_col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq("yes")
+            )
+        else:
+            df["_IsRelationship"] = False
+
+        if customer_type_col is not None:
+            df["_IsNewCustomer"] = (
+                df[customer_type_col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq("new customer")
+            )
+        else:
+            df["_IsNewCustomer"] = False
+
         cm_cols = (
             ["DM Name", "Territory", "Cluster", "CM Name"]
             if has_dm else
@@ -1410,11 +1540,19 @@ if uploaded_file:
                 cm_key,
                 {
                     "Compliant Days": 0,
+                    "Partially Compliant Days": 0,
                     "Non-Compliant Days": working_days_count,
+                    "FH Not Met Count": working_days_count,
+                    "SH Not Met Count": working_days_count,
+                    "Score": working_days_count * 2,
                 },
             )
 
-            total_non_compliances = compliance_data["Non-Compliant Days"]
+            fh_not_met_count = compliance_data["FH Not Met Count"]
+            sh_not_met_count = compliance_data["SH Not Met Count"]
+            partially_compliant_count = compliance_data["Partially Compliant Days"]
+            non_compliant_count = compliance_data["Non-Compliant Days"]
+            total_non_compliance_score = compliance_data["Score"]
 
             cm_df = df[
                 (df["Territory"] == territory)
@@ -1452,6 +1590,25 @@ if uploaded_file:
                 if not cm_df.empty else {}
             )
 
+            # Relationship with Customer count by location:
+            # Relationship with Customer == Yes.
+            relationship_counts = (
+                cm_df[cm_df["_IsRelationship"]]
+                .groupby("City")
+                .size()
+                .to_dict()
+                if not cm_df.empty else {}
+            )
+
+            # New Customer count by location: Customer Type == New Customer.
+            new_customer_counts = (
+                cm_df[cm_df["_IsNewCustomer"]]
+                .groupby("City")
+                .size()
+                .to_dict()
+                if not cm_df.empty else {}
+            )
+
             locations = sorted(
                 set(fh_location_counts.keys())
                 | set(sh_location_counts.keys()),
@@ -1464,7 +1621,24 @@ if uploaded_file:
                 row = [s_no]
                 if has_dm:
                     row.append(dm_name)
-                row += [territory, cluster, cm_name, "", 0, 0, total_logins, total_non_compliances]
+                row += [
+                    territory,
+                    cluster,
+                    cm_name,
+                    "",
+                    0,
+                    0,       # Visit Count
+                    "",      # Distance Covered (km)
+                    0,
+                    0,       # Relationship with Customer Count
+                    0,       # New Customer Count
+                    total_logins,
+                    fh_not_met_count,
+                    sh_not_met_count,
+                    partially_compliant_count,
+                    non_compliant_count,
+                    total_non_compliance_score,
+                ]
                 location_rows.append(row)
                 location_merge_sizes.append(1)
             else:
@@ -1472,7 +1646,29 @@ if uploaded_file:
                     fh_visits = int(fh_location_counts.get(location, 0))
                     sh_visits = int(sh_location_counts.get(location, 0))
                     leads = int(lead_counts.get(location, 0))
+                    relationship_count = int(relationship_counts.get(location, 0))
+                    new_customer_count = int(new_customer_counts.get(location, 0))
                     total_visits_loc = fh_visits + sh_visits
+
+                    # Distance covered for this specific location: the
+                    # radius of the CM's visits there (max distance from
+                    # the centroid of all valid pings to any one ping) —
+                    # not the first-to-last-visit distance. Still produces
+                    # a number when just one ping at the location has a
+                    # bad/missing coordinate, instead of going blank.
+                    loc_visits_df = cm_df[cm_df["City"] == location]
+                    if has_geo:
+                        loc_distance_km, loc_valid_pts = location_coverage_distance(
+                            loc_visits_df, lat_col, lon_col
+                        )
+                    else:
+                        loc_distance_km, loc_valid_pts = 0.0, 0
+                    loc_distance_display = format_distance(loc_distance_km) if loc_valid_pts > 0 else ""
+
+                    # Visit Count: distinct calendar days on which the CM
+                    # visited this location (not total FH+SH visit rows) —
+                    # i.e. how many days he visited this particular location.
+                    loc_days_count = int(loc_visits_df["LoginDate"].dt.date.nunique())
 
                     row = [s_no]
                     if has_dm:
@@ -1483,9 +1679,17 @@ if uploaded_file:
                         cm_name,
                         location,
                         total_visits_loc,
+                        loc_days_count,  # Visit Count — days visited at this location
+                        loc_distance_display,
                         leads,
+                        relationship_count,
+                        new_customer_count,
                         total_logins,
-                        total_non_compliances,
+                        fh_not_met_count,
+                        sh_not_met_count,
+                        partially_compliant_count,
+                        non_compliant_count,
+                        total_non_compliance_score,
                     ]
                     location_rows.append(row)
 
@@ -1500,9 +1704,17 @@ if uploaded_file:
             "CM Name",
             "Locations Visited",
             "Total Visits",
+            "Visit Count",
+            "Distance Covered (km)",
             "Total Leads",
+            "Relationship with Customer Count",
+            "New Customer Count",
             "Total Logins",
-            "Total Non-Compliances",
+            "FH Not Met Count",
+            "SH Not Met Count",
+            "Partially Compliant Count",
+            "Non-Compliant Count",
+            "Total Non-Compliance Score",
         ]
 
         location_df = pd.DataFrame(location_rows, columns=loc_cols)
@@ -1511,10 +1723,12 @@ if uploaded_file:
         # DM-wise subtotal rows + Grand Total row, mirroring the Summary
         # sheet. "Total Visits" / "Total Leads" are per-location figures,
         # so they're summed straight across every location row for the
-        # DM. "Total Logins" / "Total Non-Compliances" are per-CM
-        # figures that repeat across a CM's location rows, so those are
-        # summed once per unique CM instead of once per row (to avoid
-        # double-counting a CM with multiple locations).
+        # DM. "Total Logins", "FH Not Met Count", "SH Not Met Count",
+        # "Partially Compliant Count", "Non-Compliant Count", and
+        # "Total Non-Compliance Score" are per-CM figures that repeat
+        # across a CM's location rows, so those are summed once per
+        # unique CM instead of once per row (to avoid double-counting a
+        # CM with multiple locations).
         # ------------------------------------------------------------
         if has_dm and not location_df.empty:
             blank_row = {c: "" for c in location_df.columns}
@@ -1522,9 +1736,16 @@ if uploaded_file:
             new_merge_sizes = []
             grand_totals = {
                 "Total Visits": 0,
+                "Visit Count": 0,
                 "Total Leads": 0,
+                "Relationship with Customer Count": 0,
+                "New Customer Count": 0,
                 "Total Logins": 0,
-                "Total Non-Compliances": 0,
+                "FH Not Met Count": 0,
+                "SH Not Met Count": 0,
+                "Partially Compliant Count": 0,
+                "Non-Compliant Count": 0,
+                "Total Non-Compliance Score": 0,
             }
             dm_index = 0
 
@@ -1539,11 +1760,20 @@ if uploaded_file:
                 total_row["S.No"] = f"DM-{dm_index} Total"
                 total_row["DM Name"] = dm_name_val
                 total_row["Total Visits"] = int(dm_group["Total Visits"].sum())
+                total_row["Visit Count"] = int(dm_group["Visit Count"].sum())
                 total_row["Total Leads"] = int(dm_group["Total Leads"].sum())
+                total_row["Relationship with Customer Count"] = int(
+                    dm_group["Relationship with Customer Count"].sum()
+                )
+                total_row["New Customer Count"] = int(dm_group["New Customer Count"].sum())
 
                 cm_unique = dm_group.drop_duplicates(subset=["Territory", "Cluster", "CM Name"])
                 total_row["Total Logins"] = int(cm_unique["Total Logins"].sum())
-                total_row["Total Non-Compliances"] = int(cm_unique["Total Non-Compliances"].sum())
+                total_row["FH Not Met Count"] = int(cm_unique["FH Not Met Count"].sum())
+                total_row["SH Not Met Count"] = int(cm_unique["SH Not Met Count"].sum())
+                total_row["Partially Compliant Count"] = int(cm_unique["Partially Compliant Count"].sum())
+                total_row["Non-Compliant Count"] = int(cm_unique["Non-Compliant Count"].sum())
+                total_row["Total Non-Compliance Score"] = int(cm_unique["Total Non-Compliance Score"].sum())
 
                 for k in grand_totals:
                     grand_totals[k] += total_row[k]
@@ -1642,6 +1872,11 @@ if uploaded_file:
             return [fill] * len(row)
         return [""] * len(row)
 
+    def style_nonzero_count(val):
+        if isinstance(val, (int, float)) and val > 0:
+            return "background-color:#FBE7E4; color:#B03A2E; font-weight:600;"
+        return ""
+
     try:
         styled = summary_df.style.applymap(
             style_status,
@@ -1651,6 +1886,15 @@ if uploaded_file:
                 "Overall Compliance",
                 "FH Distance (km)",
                 "SH Distance (km)",
+            ]
+        ).applymap(
+            style_nonzero_count,
+            subset=[
+                "FH Not Met Count",
+                "SH Not Met Count",
+                "Partially Compliant Count",
+                "Non-Compliant Count",
+                "Total Non-Compliance Score",
             ]
         )
         if has_dm:
@@ -1669,9 +1913,20 @@ if uploaded_file:
                     else '<div class="section-label">Location Summary — one row per location visited</div>', unsafe_allow_html=True)
         st.caption(
             "One row per location visited (FH and SH visits combined). "
+            "Visit Count is the number of distinct days that location was "
+            "visited (FH and SH combined), and Distance Covered (km) is a "
+            "coverage radius — the farthest any single ping at that "
+            "location falls from the centroid of all the CM's pings there "
+            "— rather than the first-to-last-visit distance; it only shows "
+            "blank when none of that location's pings have a usable "
+            "coordinate. "
             "Total Leads are counted where Loan Requirement - Yes/No = \"Yes\". "
-            "Total Logins and Total Non-Compliances are per-CM figures "
-            "that repeat across the CM's location rows."
+            "Relationship with Customer Count is counted where Relationship "
+            "with Customer = \"Yes\", and New Customer Count is counted where "
+            "Customer Type = \"New Customer\". "
+            "Total Logins, FH/SH Not Met Count, Partially Compliant Count, "
+            "Non-Compliant Count, and Total Non-Compliance Score are per-CM "
+            "figures that repeat across the CM's location rows."
         )
 
         def style_non_compliance(val):
@@ -1690,7 +1945,16 @@ if uploaded_file:
         try:
             styled_location = location_df.style.applymap(
                 style_non_compliance,
-                subset=["Total Non-Compliances"]
+                subset=[
+                    "FH Not Met Count",
+                    "SH Not Met Count",
+                    "Partially Compliant Count",
+                    "Non-Compliant Count",
+                    "Total Non-Compliance Score",
+                ]
+            ).applymap(
+                style_status,
+                subset=["Distance Covered (km)"]
             )
             if has_dm:
                 styled_location = styled_location.apply(style_location_total_rows, axis=1)
@@ -1826,10 +2090,21 @@ if uploaded_file:
         elif c.value == "Non-Compliant":
             c.fill = red_fill
 
-        if "Total Non-Compliances" in headers:
-            c = ws.cell(row=row, column=headers["Total Non-Compliances"])
+        if "Non-Compliant Count" in headers:
+            c = ws.cell(row=row, column=headers["Non-Compliant Count"])
             if isinstance(c.value, (int, float)) and c.value > 0:
                 c.fill = red_fill
+
+        if "Partially Compliant Count" in headers:
+            c = ws.cell(row=row, column=headers["Partially Compliant Count"])
+            if isinstance(c.value, (int, float)) and c.value > 0:
+                c.fill = yellow_fill
+
+        for count_col_name in ("FH Not Met Count", "SH Not Met Count", "Total Non-Compliance Score"):
+            if count_col_name in headers:
+                c = ws.cell(row=row, column=headers[count_col_name])
+                if isinstance(c.value, (int, float)) and c.value > 0:
+                    c.fill = red_fill
 
         c = ws.cell(row=row, column=fh_distance_col)
         if c.value == DISTANCE_FLAG_LABEL:
@@ -1851,7 +2126,9 @@ if uploaded_file:
         for cell in ws_loc[1]:
             loc_headers[cell.value] = cell.column
 
-        non_compliance_col = loc_headers.get("Total Non-Compliances")
+        non_compliance_col = loc_headers.get("Non-Compliant Count")
+        partial_compliance_col = loc_headers.get("Partially Compliant Count")
+        loc_distance_col = loc_headers.get("Distance Covered (km)")
         loc_sno_col = loc_headers.get("S.No")
 
         # Merge CM-level (and DM-level) columns down each CM's location block.
@@ -1859,7 +2136,21 @@ if uploaded_file:
             loc_headers.get(name)
             for name in (
                 "S.No", "DM Name", "Territory", "Cluster", "CM Name",
-                "Total Logins", "Total Non-Compliances",
+                "Total Logins", "FH Not Met Count", "SH Not Met Count",
+                "Partially Compliant Count", "Non-Compliant Count",
+                "Total Non-Compliance Score",
+            )
+            if loc_headers.get(name)
+        ]
+
+        # Per-CM count columns that get a red highlight across the whole
+        # merged block whenever the CM's value is > 0, mirroring the
+        # Summary sheet's "Not Met" / score highlighting.
+        red_count_cols = [
+            loc_headers.get(name)
+            for name in (
+                "FH Not Met Count", "SH Not Met Count",
+                "Non-Compliant Count", "Total Non-Compliance Score",
             )
             if loc_headers.get(name)
         ]
@@ -1882,11 +2173,23 @@ if uploaded_file:
                 current_row = end_row + 1
                 continue
 
-            if non_compliance_col:
-                top_cell = ws_loc.cell(row=current_row, column=non_compliance_col)
+            for col in red_count_cols:
+                top_cell = ws_loc.cell(row=current_row, column=col)
                 if isinstance(top_cell.value, (int, float)) and top_cell.value > 0:
                     for r in range(current_row, end_row + 1):
-                        ws_loc.cell(row=r, column=non_compliance_col).fill = red_fill
+                        ws_loc.cell(row=r, column=col).fill = red_fill
+
+            if loc_distance_col:
+                for r in range(current_row, end_row + 1):
+                    c = ws_loc.cell(row=r, column=loc_distance_col)
+                    if c.value == DISTANCE_FLAG_LABEL:
+                        c.fill = red_fill
+
+            if partial_compliance_col:
+                top_cell = ws_loc.cell(row=current_row, column=partial_compliance_col)
+                if isinstance(top_cell.value, (int, float)) and top_cell.value > 0:
+                    for r in range(current_row, end_row + 1):
+                        ws_loc.cell(row=r, column=partial_compliance_col).fill = yellow_fill
 
             if group_size > 1:
                 for col in merge_cols:
@@ -1920,9 +2223,16 @@ if uploaded_file:
     </div>
     """, unsafe_allow_html=True)
 
+    if date_from == date_to:
+        file_date_label = date_from.strftime("%d-%b-%Y")
+    else:
+        file_date_label = f"{date_from.strftime('%d-%b-%Y')}_to_{date_to.strftime('%d-%b-%Y')}"
+
+    report_filename = f"Summary_Report_{file_date_label}.xlsx"
+
     st.download_button(
         "Download summary report (.xlsx)",
         data=final_output,
-        file_name="Summary_Report.xlsx",
+        file_name=report_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
