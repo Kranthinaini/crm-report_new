@@ -312,7 +312,66 @@ else:
 # nobody in the file logged a visit on it) — see the "Working Days Count"
 # block further down.
 num_days = (date_to - date_from).days + 1
-HOURS_PER_DAY_PER_HALF = 2
+
+if date_from == date_to:
+    st.caption(f"Showing visits for: {date_from.strftime('%d-%b-%Y')}")
+else:
+    st.caption(
+        f"Showing visits from {date_from.strftime('%d-%b-%Y')} to {date_to.strftime('%d-%b-%Y')} "
+        f"({num_days} calendar day(s)). Required FH/SH hours will be based on the "
+        f"actual working-day count once the CRM file is uploaded — any date with "
+        f"no login activity from anyone is treated as a holiday and excluded."
+    )
+
+# ============================================================
+# FH / SH target per working day (configurable)
+# ============================================================
+# The in-field requirement for each half used to be hard-coded at 2 hours.
+# It's now set from the UI below so the threshold can be tuned to the
+# situation (e.g. 1 hr 55 min). Everything downstream — Met/Not Met
+# status, the per-day compliance counts, the weighted score and the Excel
+# highlighting — reads from MINUTES_PER_DAY_PER_HALF, so changing these
+# inputs propagates everywhere.
+
+st.markdown(
+    '<div class="section-label" style="margin-top:0.6rem;">FH / SH target per working day</div>',
+    unsafe_allow_html=True
+)
+
+thr_col1, thr_col2, _thr_spacer = st.columns([1, 1, 2])
+
+with thr_col1:
+    target_hours = st.number_input(
+        "Hours",
+        min_value=0,
+        max_value=12,
+        value=2,
+        step=1,
+        key="target_hours"
+    )
+
+with thr_col2:
+    target_minutes = st.number_input(
+        "Minutes",
+        min_value=0,
+        max_value=59,
+        value=0,
+        step=5,
+        key="target_minutes"
+    )
+
+MINUTES_PER_DAY_PER_HALF = int(target_hours) * 60 + int(target_minutes)
+
+if MINUTES_PER_DAY_PER_HALF == 0:
+    st.error("The FH/SH target can't be zero — set at least 1 minute.")
+    st.stop()
+
+TARGET_LABEL = f"{int(target_hours)}:{int(target_minutes):02d}"
+
+st.caption(
+    f"Each half (FH and SH) needs at least {TARGET_LABEL} hrs of in-field time "
+    f"per working day."
+)
 
 # Distance threshold above which we flag instead of showing the number
 DISTANCE_FLAG_KM = 200
@@ -365,25 +424,16 @@ def get_dm_name(territory):
         return "Unassigned"
     return TERRITORY_TO_DM.get(str(territory).strip().lower(), "Unassigned")
 
-if date_from == date_to:
-    st.caption(f"Showing visits for: {date_from.strftime('%d-%b-%Y')}")
-else:
-    st.caption(
-        f"Showing visits from {date_from.strftime('%d-%b-%Y')} to {date_to.strftime('%d-%b-%Y')} "
-        f"({num_days} calendar day(s)). Required FH/SH hours will be based on the "
-        f"actual working-day count once the CRM file is uploaded — any date with "
-        f"no login activity from anyone is treated as a holiday and excluded."
-    )
 
 if not uploaded_file:
-    st.markdown("""
+    st.markdown(f"""
     <div class="card">
         <div class="section-label">Waiting for a file</div>
         <p style="color:var(--muted); margin:0;">
         Drop the CRM export above to generate the compliance summary for the
         selected date range. Field-half (FH) visits before 2 PM need at least
-        2 hours in-field per working day; second-half (SH) visits need at
-        least 2 hours per working day. A date with zero login activity from
+        {TARGET_LABEL} hrs in-field per working day; second-half (SH) visits need at
+        least {TARGET_LABEL} hrs per working day. A date with zero login activity from
         anyone is treated as a holiday and excluded from the working-day
         count, so the required FH/SH hours scale with the actual number of
         working days in the range — not just its calendar length. The
@@ -549,9 +599,10 @@ def daily_summed_minutes(session_df):
     Given a subset of rows for one CM/one session (FH or SH), computes
     (last visit - first visit) *per calendar day* and sums those daily
     spans together. This is what gets compared against the multi-day
-    target (num_days x 2 hours), instead of naively taking the first and
-    last timestamp across the whole selected range (which would overstate
-    "in-field time" whenever the range covers more than one day).
+    target (num_days x the configured per-half target), instead of naively
+    taking the first and last timestamp across the whole selected range
+    (which would overstate "in-field time" whenever the range covers more
+    than one day).
     """
     if session_df.empty:
         return 0
@@ -569,22 +620,22 @@ def daily_compliance_details(fh_df, sh_df, working_dates):
     """
     Calculates compliance day counts once per CM.
 
-    A day is compliant only when both FH and SH meet the 2-hour target.
-    The same result is used by Summary and Location Summary so their
-    compliant/non-compliant counts always match.
+    A day is compliant only when both FH and SH meet the configured
+    per-half target (MINUTES_PER_DAY_PER_HALF). The same result is used by
+    Summary and Location Summary so their compliant/non-compliant counts
+    always match.
 
     Also tracks, per working day, whether FH and/or SH individually missed
-    the 2-hour target (FH Not Met Count / SH Not Met Count — these count
-    every day the given half fell short, regardless of the other half's
-    status), and rolls the day-level outcomes into a single weighted
-    "Score": each Non-Compliant day contributes 2 points and each
-    Partially Compliant day contributes 1 point (Fully Compliant days
-    contribute 0).
+    the target (FH Not Met Count / SH Not Met Count — these count every day
+    the given half fell short, regardless of the other half's status), and
+    rolls the day-level outcomes into a single weighted "Score": each
+    Non-Compliant day contributes 2 points and each Partially Compliant day
+    contributes 1 point (Fully Compliant days contribute 0).
 
     Returns a dict with keys: "Compliant Days", "Partially Compliant Days",
     "Non-Compliant Days", "FH Not Met Count", "SH Not Met Count", "Score".
     """
-    threshold = HOURS_PER_DAY_PER_HALF * 60
+    threshold = MINUTES_PER_DAY_PER_HALF
 
     fh_daily = (
         fh_df.groupby(fh_df["LoginDate"].dt.date)["LoginDate"]
@@ -1034,18 +1085,20 @@ if uploaded_file:
     # Actual working days within the selected range: any date on which
     # *no employee at all* has a login is treated as a holiday (Sundays,
     # off-Saturdays, etc.) and excluded from the working-day count. The
-    # FH/SH requirement for every CM is then working_days_count x 2 hrs.
+    # FH/SH requirement for every CM is then
+    # working_days_count x the configured per-half target.
     # ------------------------------------------------------------
     all_range_dates = list(pd.date_range(date_from, date_to).date)
     working_dates = sorted(df["LoginDate"].dt.date.unique())
     holiday_dates = [d for d in all_range_dates if d not in working_dates]
 
     working_days_count = len(working_dates)
-    fh_required_minutes = working_days_count * HOURS_PER_DAY_PER_HALF * 60
-    sh_required_minutes = working_days_count * HOURS_PER_DAY_PER_HALF * 60
+    fh_required_minutes = working_days_count * MINUTES_PER_DAY_PER_HALF
+    sh_required_minutes = working_days_count * MINUTES_PER_DAY_PER_HALF
 
     required_msg = (
         f"Working Days Count: {working_days_count} of {num_days} day(s) in range. "
+        f"Target per half per working day: {TARGET_LABEL} hrs. "
         f"Required per CM: FH {fh_required_minutes // 60}:{fh_required_minutes % 60:02d} hrs, "
         f"SH {sh_required_minutes // 60}:{sh_required_minutes % 60:02d} hrs."
     )
@@ -2214,11 +2267,12 @@ if uploaded_file:
 
     st.markdown('<div class="checkpoint-divider"></div>', unsafe_allow_html=True)
 
-    st.markdown("""
+    st.markdown(f"""
     <div class="card">
         <div class="section-label">Export</div>
         <p style="color:var(--muted); margin:0 0 1rem 0;">
         Download the same summary as a formatted, ready-to-share Excel report.
+        Generated with an FH/SH target of {TARGET_LABEL} hrs per working day.
         </p>
     </div>
     """, unsafe_allow_html=True)
@@ -2228,7 +2282,9 @@ if uploaded_file:
     else:
         file_date_label = f"{date_from.strftime('%d-%b-%Y')}_to_{date_to.strftime('%d-%b-%Y')}"
 
-    report_filename = f"Summary_Report_{file_date_label}.xlsx"
+    target_file_label = f"{int(target_hours)}h{int(target_minutes):02d}m"
+
+    report_filename = f"Summary_Report_{file_date_label}_{target_file_label}.xlsx"
 
     st.download_button(
         "Download summary report (.xlsx)",
